@@ -23,8 +23,21 @@ jobs:
           echo "9be587b90f860001dd7f1cedaf12b1cd55e4186e6ad34584b5217c9a3016d2a7  make_android.sh" | sha256sum -c
           bash make_android.sh
       - name: Compilar APK
-        run: gradle -p android assembleRelease --no-daemon
+        run: |
+          set -o pipefail
+          gradle -p android assembleRelease --no-daemon --console=plain 2>&1 | tee build.log
+      - name: Resumo do erro
+        if: failure()
+        run: |
+          echo "=== primeiras linhas de erro ==="
+          grep -n -m 30 -E "CMake Error|FAILED:|error:|fatal error|undefined reference|undefined symbol|No such file|Could not" build.log | cut -c1-260 || true
+          echo "=== contexto do primeiro CMake Error ==="
+          grep -n -m 1 -A14 "CMake Error" build.log | cut -c1-260 || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: MH3-apk
-          path: android/app/build/outputs/apk/release/*.apk
+          name: MH3-apk-e-log
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            build.log
+          if-no-files-found: warn
