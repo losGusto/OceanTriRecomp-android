@@ -1,0 +1,427 @@
+name: android-apk
+on:
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.9' }
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: mh3-android, max-size: 2G }
+      - name: Android SDK
+        run: |
+          bash -c 'yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses' >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" "cmake;3.31.6" "platforms;android-34" "build-tools;34.0.0"
+      - name: Gerar projeto Android
+        run: |
+          cat > make_android.sh <<'MAKE_ANDROID_EOF'
+          #!/bin/bash
+          # make_android.sh - gera o app Android do OceanTriRecomp (Monster Hunter Tri).
+          # Rode na RAIZ do repositório (a pasta com runtime/, aurora-main/, generated/).
+          # Cria: android/ (projeto Gradle), .github/workflows/android.yml e aplica 2
+          # patches pequenos. É idempotente: pode rodar de novo sem duplicar nada.
+          # SKIP_SDL=1 pula o download dos .java do SDL (para teste local sem internet).
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          [ -f runtime/CMakeLists.txt ] && [ -d aurora-main ] || { echo "Rode na raiz do repo (runtime/ e aurora-main/)"; exit 1; }
+
+          SDL_VERSION=3.4.4
+          PKG=com/mh3/port
+          A=android/app/src/main
+          mkdir -p android/compat android/app/src/main/java/$PKG .github/workflows
+
+          # ---------------------------------------------------------------- patch 1
+          # O jogo procura disc/ ao lado do executável (/proc/self/exe). No Android isso
+          # aponta para app_process (somente leitura). MH3_ROOT_DIR redireciona a raiz.
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("runtime/include/win_posix_dir.h")
+          s = p.read_text()
+          old = 'inline std::filesystem::path mh3_self_exe() { return std::filesystem::read_symlink("/proc/self/exe"); }'
+          new = ('inline std::filesystem::path mh3_self_exe() { '
+                 'if (const char* r = std::getenv("MH3_ROOT_DIR")) return std::filesystem::path(r) / "MH3"; '
+                 'return std::filesystem::read_symlink("/proc/self/exe"); }')
+          if "MH3_ROOT_DIR" in s:
+              print("patch win_posix_dir.h: já aplicado")
+          elif old in s:
+              p.write_text(s.replace(old, new)); print("patch win_posix_dir.h: ok")
+          else:
+              raise SystemExit("ERRO: linha mh3_self_exe não encontrada em win_posix_dir.h")
+          PYEOF
+
+          # ---------------------------------------------------------------- patch 2
+          # runtime/CMakeLists.txt referencia ../tests/native/*, que não vem no zip.
+          # Arquivos vazios bastam: só o alvo MH3 é compilado.
+          python3 - <<'PYEOF'
+          import re, pathlib
+          txt = pathlib.Path("runtime/CMakeLists.txt").read_text()
+          n = 0
+          for m in sorted(set(re.findall(r'\.\./tests/native/[A-Za-z0-9_./-]+', txt))):
+              path = pathlib.Path("runtime") / m
+              if path.exists():
+                  continue
+              if "." in path.name:
+                  path.parent.mkdir(parents=True, exist_ok=True); path.touch()
+              else:
+                  path.mkdir(parents=True, exist_ok=True)
+              n += 1
+          print(f"stubs de tests/native criados: {n}")
+          PYEOF
+
+          # ---------------------------------------------------------- compat bionic
+          cat > android/compat/execinfo.h <<'EOF'
+          #pragma once
+          /* A bionic só tem execinfo.h a partir da API 33; main.cpp usa backtrace(). */
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          static inline int backtrace(void** b, int n) { (void)b; (void)n; return 0; }
+          static inline void backtrace_symbols_fd(void* const* b, int n, int fd) { (void)b; (void)n; (void)fd; }
+          #ifdef __cplusplus
+          }
+          #endif
+          EOF
+
+          # ------------------------------------------------- CMake (project include)
+          cat > android/android_project.cmake <<'EOF'
+          # Incluído logo após project() de runtime/CMakeLists.txt (CMAKE_PROJECT_INCLUDE).
+          # No Android o jogo precisa ser a biblioteca libmain.so (carregada pelo
+          # SDLActivity), não um executável.
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          include_directories(BEFORE ${CMAKE_CURRENT_LIST_DIR}/compat)
+
+          function(add_executable name)
+            if(name STREQUAL "MH3")
+              add_library(MH3 SHARED ${ARGN})
+              set_target_properties(MH3 PROPERTIES OUTPUT_NAME main)
+              target_sources(MH3 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/android_entry.cpp)
+              target_link_libraries(MH3 PRIVATE log android EGL GLESv3)
+              if(AURORA_SDL3_TARGET)
+                target_link_libraries(MH3 PRIVATE ${AURORA_SDL3_TARGET})
+              endif()
+            else()
+              _add_executable(${name} ${ARGN})
+            endif()
+          endfunction()
+          EOF
+
+          # ---------------------------------------------------- entrada nativa (JNI)
+          cat > android/android_entry.cpp <<'EOF'
+          // Ponto de entrada Android: SDL_main -> main() do jogo, mais o gamepad virtual
+          // que recebe os toques do overlay Java.
+          #include <SDL3/SDL.h>
+          #include <jni.h>
+
+          #include <chrono>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <fstream>
+          #include <string>
+          #include <thread>
+          #include <unistd.h>
+
+          extern "C" int mh3_real_main(int argc, char** argv) __asm__("main");
+
+          static SDL_Joystick* g_virtual = nullptr;
+
+          // Cria o gamepad virtual quando o SDL já iniciou e não há controle físico.
+          static SDL_Joystick* EnsureVirtualPad() {
+              if (g_virtual)
+                  return g_virtual;
+              if (!SDL_WasInit(SDL_INIT_JOYSTICK))
+                  return nullptr;
+              int count = 0;
+              SDL_JoystickID* pads = SDL_GetGamepads(&count);
+              SDL_free(pads);
+              if (count > 0)
+                  return nullptr; // há controle físico: ele tem prioridade
+              SDL_VirtualJoystickDesc desc;
+              SDL_INIT_INTERFACE(&desc);
+              desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+              desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+              desc.nbuttons = 21;
+              desc.name = "MH3 Touch";
+              const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+              if (id)
+                  g_virtual = SDL_OpenJoystick(id);
+              return g_virtual;
+          }
+
+          extern "C" JNIEXPORT void JNICALL Java_com_mh3_port_TouchOverlay_nativeButton(JNIEnv*, jclass, jint id, jboolean down) {
+              if (auto* js = EnsureVirtualPad())
+                  SDL_SetJoystickVirtualButton(js, id, down != JNI_FALSE);
+          }
+
+          extern "C" JNIEXPORT void JNICALL Java_com_mh3_port_TouchOverlay_nativeAxis(JNIEnv*, jclass, jint axis, jint value) {
+              if (auto* js = EnsureVirtualPad())
+                  SDL_SetJoystickVirtualAxis(js, axis, static_cast<Sint16>(value));
+          }
+
+          extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** argv) {
+              const char* base = SDL_GetAndroidInternalStoragePath();
+              const std::string root = base ? base : "/data/local/tmp";
+              setenv("MH3_ROOT_DIR", root.c_str(), 1);
+              setenv("MH3_USER_DIR", (root + "/user").c_str(), 1);
+              mkdir((root + "/user").c_str(), 0700);
+              if (chdir(root.c_str()) != 0)
+                  std::perror("chdir");
+              // stdout/stderr vão para files/MH3.log (progresso da conversão, falhas).
+              std::freopen((root + "/MH3.log").c_str(), "w", stdout);
+              std::freopen((root + "/MH3.log").c_str(), "a", stderr);
+
+              // Vigia: marca .ready quando os dados do disco foram preparados (o jogo
+              // define MH3_DISC_DIR só no fim da preparação) e liga o gamepad virtual.
+              std::thread([root] {
+                  bool marked = false;
+                  for (;;) {
+                      if (!marked && std::getenv("MH3_DISC_DIR")) {
+                          std::ofstream(root + "/.ready") << "1";
+                          marked = true;
+                      }
+                      EnsureVirtualPad();
+                      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                  }
+              }).detach();
+
+              return mh3_real_main(argc, argv);
+          }
+          EOF
+
+          # ------------------------------------------------------------------ Gradle
+          cat > android/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "MH3"
+          include ':app'
+          EOF
+          cat > android/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4g
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF
+          cat > android/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.mh3.port'
+              compileSdk 34
+              ndkVersion '27.2.12479018'
+
+              defaultConfig {
+                  applicationId 'com.mh3.port'
+                  minSdk 30            // memfd_create exige API 30
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+                  ndk { abiFilters 'arm64-v8a' }
+                  externalNativeBuild {
+                      cmake {
+                          targets 'MH3'
+                          arguments "-DANDROID_STL=c++_shared",
+                              "-DCMAKE_BUILD_TYPE=Release",
+                              "-DMH3_AURORA_ROOT=${rootDir}/../aurora-main",
+                              "-DAURORA_SDL3_PROVIDER=vendor",
+                              "-DAURORA_SDL3_LINKAGE=shared",
+                              "-DAURORA_SDL3_VERSION=3.4.4",
+                              "-DAURORA_ENABLE_CARD=OFF",
+                              "-DFETCHCONTENT_BASE_DIR=${rootDir}/.deps",
+                              "-DCMAKE_PROJECT_INCLUDE=${rootDir}/android_project.cmake",
+                              "-DCMAKE_PROJECT_aurora_INCLUDE=${rootDir}/../scripts/aurora-compat.cmake",
+                              "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+                              "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+                      }
+                  }
+              }
+              externalNativeBuild {
+                  cmake {
+                      path file('../../runtime/CMakeLists.txt')
+                      version '3.31.6'
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug   // APK instalável sem keystore própria
+                  }
+              }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          EOF
+
+          # ---------------------------------------------------------------- Manifest
+          cat > $A/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <application
+                  android:label="Monster Hunter Tri"
+                  android:allowBackup="false"
+                  android:hasCode="true"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <activity android:name=".LauncherActivity" android:exported="true"
+                      android:screenOrientation="sensorLandscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".MainActivity" android:exported="false"
+                      android:screenOrientation="sensorLandscape"
+                      android:launchMode="singleTask"
+                      android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation" />
+              </application>
+          </manifest>
+          EOF
+
+          # -------------------------------------------------------------------- Java
+          cat > $A/java/$PKG/LauncherActivity.java <<'EOF'
+          package com.mh3.port;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.io.File;
+
+          public class LauncherActivity extends Activity {
+              private static final int PICK = 1;
+              private TextView status;
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  root.setPadding(48, 48, 48, 48);
+                  status = new TextView(this);
+                  status.setTextSize(16);
+                  status.setGravity(Gravity.CENTER);
+                  Button pick = new Button(this);
+                  pick.setText("Escolher disco (.iso / .rvz / .wia)");
+                  Button play = new Button(this);
+                  play.setText("Jogar");
+                  root.addView(status);
+                  root.addView(pick);
+                  root.addView(play);
+                  setContentView(root);
+
+                  pick.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.addCategory(Intent.CATEGORY_OPENABLE);
+                      i.setType("*/*");
+                      i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                      startActivityForResult(i, PICK);
+                  });
+                  play.setOnClickListener(v -> {
+                      if (!ready() && prefs().getString("disc_uri", null) == null) {
+                          Toast.makeText(this, "Escolha o disco primeiro", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      startActivity(new Intent(this, MainActivity.class));
+                  });
+                  refresh();
+              }
+
+              private SharedPreferences prefs() { return getSharedPreferences("mh3", 0); }
+              private boolean ready() { return new File(getFilesDir(), ".ready").exists(); }
+
+              private void refresh() {
+                  if (ready()) status.setText("Dados do jogo prontos.");
+                  else if (prefs().getString("disc_uri", null) != null)
+                      status.setText("Disco selecionado. O 1º início converte os dados e pode demorar (tela preta). Log: files/MH3.log");
+                  else status.setText("Nenhum disco selecionado (Monster Hunter Tri, versão europeia).");
+              }
+
+              @Override protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != PICK || res != RESULT_OK || data == null || data.getData() == null) return;
+                  Uri u = data.getData();
+                  try {
+                      getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  } catch (Exception ignored) { }
+                  prefs().edit().putString("disc_uri", u.toString()).apply();
+                  new File(getFilesDir(), ".ready").delete(); // disco novo: reprocessar
+                  refresh();
+              }
+
+              @Override protected void onResume() { super.onResume(); refresh(); }
+          }
+          EOF
+
+          cat > $A/java/$PKG/MainActivity.java <<'EOF'
+          package com.mh3.port;
+
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.ParcelFileDescriptor;
+          import java.io.File;
+          import org.libsdl.app.SDLActivity;
+
+          public class MainActivity extends SDLActivity {
+              private static ParcelFileDescriptor pfd; // mantém o descritor aberto
+
+              @Override protected String[] getLibraries() { return new String[] { "SDL3", "main" }; }
+
+              @Override protected String[] getArguments() {
+                  if (new File(getFilesDir(), ".ready").exists()) return new String[0];
+                  String s = getSharedPreferences("mh3", 0).getString("disc_uri", null);
+                  if (s == null) return new String[0];
+                  try {
+                      pfd = getContentResolver().openFileDescriptor(Uri.parse(s), "r");
+                      return new String[] { "--rom", "/proc/self/fd/" + pfd.getFd() };
+                  } catch (Exception e) {
+                      return new String[0];
+                  }
+              }
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  try { mLayout.addView(new TouchOverlay(this)); } catch (Throwable ignored) { }
+              }
+          }
+          EOF
+
+          cat > $A/java/$PKG/TouchOverlay.java <<'EOF'
+          package com.mh3.port;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.util.SparseArray;
+          import android.view.MotionEvent;
+          import android.view.View;
+
+          /** Controles de toque: injetam um gamepad virtual do SDL (ids = SDL_GamepadButton/Axis). */
+          public class TouchOverlay extends View {
+              static native void nativeButton(int id, boolean down);
+              static native void nativeAxis(int axis, int value);
+
+              private static class Btn { String label; int id; int axis = -1; float cx, cy, r; boolean down; }
+              private static class Stick { int ax, ay; float ox, oy, dx, dy; boolean active; }
+
+              private final java.util.ArrayList<Btn> btns = new java.util.ArrayList<>();
+              private final Stick left = new Stick(), right = new Stick();
+              private final SparseArray<Object> owners = new SparseArray<>();
+              private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private float u = 1;
+
+              public TouchOverlay(Context c) {
+                  super(c);
+                  left.ax = 0; left.ay = 1;     // LEFTX, LEFTY
+                  right.ax = 2; right.ay = 3;   // RIGHTX, RIGHTY
+                  p.setT
